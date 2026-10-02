@@ -1,8 +1,2 @@
-wget
-jdatetime
-requests
-tldextract
-beautifulsoup4
-geoip2
-dnspython
-pycountry_convert
+# Compatibility with the original installation command.
+-r requirements.txt

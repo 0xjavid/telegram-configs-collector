@@ -1,0 +1,16 @@
+# Python environments and tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Downloaded databases and atomic-write temporary files
+geoip-lite/*.mmdb
+*.tmp
