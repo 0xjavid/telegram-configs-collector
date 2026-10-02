@@ -1,5 +1,8 @@
 from datetime import datetime
 import importlib
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -287,3 +290,56 @@ def test_html_subscription_content_uses_bounded_fetch(monkeypatch):
     monkeypatch.setattr(main, "fetch_text", fetch)
     assert main.html_content("https://example.org/feed") == "trojan://secret@192.0.2.1:443"
     fetch.assert_called_once_with("https://example.org/feed")
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("https://example.org/sub?token=abc%3D%3D", ["https://example.org/sub?token=abc%3D%3D"]),
+        ("HTTP://example.org/sub.txt", ["HTTP://example.org/sub.txt"]),
+        ("t.me/public_channel", ["t.me/public_channel"]),
+        ("www.example.org/sub", ["www.example.org/sub"]),
+        ('<a href="https://example.org/sub">Subscribe</a>', ["https://example.org/sub"]),
+        ("(https://example.org/sub)", ["https://example.org/sub"]),
+        ("https://one.example/sub\nhttps://two.example/sub", ["https://one.example/sub", "https://two.example/sub"]),
+        ("user@sub.example.org", []),
+    ],
+)
+def test_url_discovery_preserves_supported_formats(text, expected):
+    assert main.find_matches(text)[1] == expected
+
+
+def test_url_discovery_handles_backtracking_attack_with_a_deadline(tmp_path):
+    # A subprocess deadline prevents the vulnerable legacy matcher from hanging
+    # the entire test suite if it is accidentally reintroduced.
+    script = """
+import socket
+import requests
+from dns import resolver
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("Regression tests must not use the network")
+
+requests.sessions.Session.request = forbidden
+resolver.Resolver.resolve = forbidden
+socket.create_connection = forbidden
+socket.gethostbyname = forbidden
+socket.getaddrinfo = forbidden
+socket.socket.connect = forbidden
+socket.socket.connect_ex = forbidden
+
+from main import find_matches
+url = "https://example.org/" + "!" * 256
+assert find_matches(url)[1] == [url]
+assert find_matches("a." * 4096 + "!")[1] == []
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(Path(main.__file__).parent), "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
