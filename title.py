@@ -1,36 +1,41 @@
-#import requirement libraries
-import os
-import uuid
-import time
-import random
-import json
-import pycountry_convert as pc
+"""Validate and label proxy configurations, with best-effort network lookups."""
 
-#import web-based libraries
-import html
-import requests
-import socket
-import ipaddress
-import ssl
-import tldextract
-import geoip2.database
-import json
-from dns import resolver, rdatatype
-
-#import regex and encoding libraries
-import re
 import base64
+import html
+import ipaddress
+import json
+import logging
+from pathlib import Path
+import socket
+import time
+import uuid
+import re
+
+from dns.exception import DNSException
+from dns import resolver, rdatatype
+import geoip2.database
+import geoip2.errors
+from maxminddb import InvalidDatabaseError
+import pycountry
+import requests
+import tldextract
+
+from collector_io import fetch_text
+from config_utils import decode_base64, encode_config_params, is_valid_base64, parse_config_params
 
 
-def is_valid_base64(string_value):
-    try:
-        # Decode the string using base64
-        byte_decoded = base64.b64decode(string_value)
-        # Encode the decoded bytes back to base64 and compare to the original string
-        return base64.b64encode(byte_decoded).decode("utf-8") == string_value
-    except:
-        # If an exception is raised during decoding, the string is not valid base64
-        return False
+LOGGER = logging.getLogger(__name__)
+# Use tldextract's bundled suffix list rather than making hidden HTTP requests.
+DOMAIN_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+
+
+def validate_config_port(port):
+    if isinstance(port, bool) or not isinstance(port, (str, int)):
+        raise ValueError("Port must be an integer")
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError("Port must be between 1 and 65535")
+    return port
 
 
 def is_valid_uuid(value):
@@ -44,60 +49,58 @@ def is_valid_uuid(value):
 
 
 def is_valid_domain(hostname):
-    # Extract the TLD, domain, and subdomain from the hostname
-    ext = tldextract.extract(hostname)
-    # Check if the domain and TLD are not empty
-    return ext.domain != "" and ext.suffix != ""
+    if not isinstance(hostname, str):
+        return False
+    extracted = DOMAIN_EXTRACTOR(hostname)
+    return bool(extracted.domain and extracted.suffix)
+
+
+
+def strip_ip_brackets(ip):
+    if ip.startswith("[") and ip.endswith("]"):
+        return ip[1:-1]
+    return ip
 
 
 def is_valid_ip_address(ip):
+    if not isinstance(ip, str):
+        return False
     try:
-        if ip.startswith("[") and ip.endswith("]"):
-            ip = ip.replace("[", "")
-            ip = ip.replace("]", "")
-        # Try out to return True if it's IPV4 or IPV6
-        ipaddress.ip_address(ip)
+        ipaddress.ip_address(strip_ip_brackets(ip))
         return True
     except ValueError:
-        # Else it returns False
         return False
 
 
 def is_ipv6(ip):
+    if not isinstance(ip, str):
+        return False
     try:
-        # Try out to return True if it's IPV6
-        ipaddress.ip_address(ip)
-        if ":" in ip:
-            return True
-        else:
-            # Else it returns False
-            return False
+        return ipaddress.ip_address(strip_ip_brackets(ip)).version == 6
     except ValueError:
         return False
 
 
 def get_ips(node):
-    try:
-        res = resolver.Resolver()
-        res.nameservers = ["8.8.8.8"]
-
-        # Retrieve IPV4 and IPV6
-        answers_ipv4 = res.resolve(node, rdatatype.A, raise_on_no_answer=False)
-        answers_ipv6 = res.resolve(node, rdatatype.AAAA, raise_on_no_answer=False)
-
-        # Initialize set for IPV4 and IPV6
-        ips = set()
-
-        # Append IPV4 and IPV6 into set
-        for rdata in answers_ipv4:
-            ips.add(rdata.address)
-
-        for rdata in answers_ipv6:
-            ips.add(rdata.address)
-
-        return ips
-    except Exception:
+    if not isinstance(node, str) or not node:
         return None
+    if is_valid_ip_address(node):
+        return {strip_ip_brackets(node)}
+    try:
+        dns_resolver = resolver.Resolver()
+    except DNSException:
+        return None
+    dns_resolver.timeout = 2
+    dns_resolver.lifetime = 5
+    addresses = set()
+    # Failure/no answer for one family must not discard the other family.
+    for record_type in (rdatatype.A, rdatatype.AAAA):
+        try:
+            answers = dns_resolver.resolve(node, record_type, raise_on_no_answer=False)
+            addresses.update(answer.address for answer in answers)
+        except DNSException:
+            continue
+    return addresses or None
 
 
 def get_ip(node):
@@ -110,18 +113,15 @@ def get_ip(node):
 
 def get_country_from_ip(ip):
     if not is_valid_ip_address(ip):
-        ips_list = list(get_ips(ip))
-        ip = ips_list[0]
+        addresses = get_ips(ip)
+        if not addresses:
+            return "NA"
+        ip = sorted(addresses)[0]
+    ip = strip_ip_brackets(ip)
     try:
         with geoip2.database.Reader("./geoip-lite/geoip-lite-country.mmdb") as reader:
-            response = reader.country(ip)
-            country_code = response.country.iso_code
-        if not country_code is None:
-            return country_code
-        else:
-            # If country code is NoneType, Returns 'NA'
-            return "NA"
-    except:
+            return reader.country(ip).country.iso_code or "NA"
+    except (OSError, ValueError, geoip2.errors.GeoIP2Error, InvalidDatabaseError):
         return "NA"
 
 
@@ -134,74 +134,61 @@ def get_country_flag(country_code):
     return html.unescape("".join(["&#x{:X};".format(c) for c in codepoints]))
 
 
-def get_continent(country_code):
-    continent_code = pc.country_alpha2_to_continent_code(country_code)
-    if continent_code in ['NA', 'SA']:
-        continent_emoji = "\U0001F30E"
-    elif continent_code in ['EU', 'AF', 'AN']:
-        continent_emoji = "\U0001F30D"
-    elif continent_code in ['AS', 'OC']:
-        continent_emoji = "\U0001F30F"
-    
-    return continent_emoji
 
 
 def check_port(ip, port, timeout=1):
-    """
-    Check if a port is open on a given IP address.
-
-    Args:
-    ip (str): The IP address.
-    port (int): The port number.
-    timeout (int, optional): The timeout in seconds. Defaults to 5.
-
-    Returns:
-    bool: True if the port is open, False otherwise.
-    """
+    """Check TCP connectivity; close the socket on success or failure."""
     try:
-        sock = socket.create_connection(address=(ip, port), timeout=timeout)
-        sock.close()
-        print("Connection Port: Open".upper())
-        return True
-    except:
-        print("Connection Port: Closed\n".upper())
+        with socket.create_connection((ip, validate_config_port(port)), timeout=timeout):
+            print("CONNECTION PORT: OPEN")
+            return True
+    except (OSError, ValueError, TypeError):
+        print("CONNECTION PORT: CLOSED\n")
         return False
 
 
 def ping_ip_address(ip, port):
     try:
-        it = time.time()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        result = sock.connect_ex((ip, port))
-        ft = time.time()
-        sock.close()
-        if result == 0:
-            return round((ft - it) * 1000, 2)
-        else:
-            return round(0, 2)
-    except:
-        return round(0, 2)
+        started = time.perf_counter()
+        with socket.create_connection((ip, validate_config_port(port)), timeout=1):
+            return round((time.perf_counter() - started) * 1000, 2)
+    except (OSError, ValueError, TypeError):
+        return 0.0
 
 
 def get_isp(node):
-    if node.startswith("[") and node.endswith("]"):
-        node = node.replace("[", "")
-        node = node.replace("]", "")
+    if not isinstance(node, str):
+        return "Not Available"
+    node = strip_ip_brackets(node)
     try:
-        ip_geo_info = requests.get(f'http://ip-api.com/json/{node}')
-        ip_geo_info_dict = json.loads(ip_geo_info.text)
-        isp_value = [char for char in list(ip_geo_info_dict["isp"]) if char not in [',', '.', '"']]
-        isp_value = ''.join(isp_value)
-        return isp_value
-    except:
+        # The public free ip-api endpoint only supports HTTP.
+        information = json.loads(fetch_text(f"http://ip-api.com/json/{node}"))
+        return "".join(char for char in information["isp"] if char not in ',.\"')
+    except (requests.RequestException, ValueError, KeyError, TypeError):
         return "Not Available"
 
 
-def check_modify_config(array_configuration, protocol_type, check_connection = True):
+def check_modify_config(array_configuration, protocol_type, check_connection=True):
+    """Keep a malformed entry from aborting validation of an entire feed."""
+    results = tuple([] for _ in range(7))
+    for element in array_configuration:
+        if not isinstance(element, str):
+            LOGGER.warning("Skipping a non-text %s configuration", protocol_type)
+            continue
+        try:
+            modified = _check_modify_config([element], protocol_type, check_connection)
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            LOGGER.warning("Skipping a malformed %s configuration: %s", protocol_type, exc)
+            continue
+        for destination, values in zip(results, modified):
+            destination.extend(values)
+    return results
+
+
+def _check_modify_config(array_configuration, protocol_type, check_connection = True):
     # Initialize list for modified elements of configuration array
     modified_array = list()
-    
+
     # Initialize array for security types of configuration
     tls_array = list()
     non_tls_array = list()
@@ -211,7 +198,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
     ws_array = list()
     http_array = list()
     grpc_array = list()
-    
+
     if protocol_type == 'SHADOWSOCKS':
         for element in array_configuration:
             # Define ShadowSocks protocol type pattern
@@ -266,7 +253,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 shadowsocks_pattern = (r"(?P<id>[^@]+)@\[?(?P<ip>[a-zA-Z0-9\.:-]+?)\]?:(?P<port>[0-9]+)")
 
                 # Try out to match pattern and configuration
-                shadowsocks_match = re.match(shadowsocks_pattern, base64.b64decode(config["id"]).decode("utf-8", errors="ignore"), flags=re.IGNORECASE)
+                shadowsocks_match = re.match(shadowsocks_pattern, decode_base64(config["id"]).decode("utf-8", errors="ignore"), flags=re.IGNORECASE)
 
                 if shadowsocks_match is None:
                     # Append no matches ShadowSocks into unmatched file
@@ -284,6 +271,8 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                     "title": config["title"],
                 }
 
+
+            config["port"] = str(validate_config_port(config["port"]))
 
             # Initialize set to append IP addresses
             ips_list = {config["ip"]}
@@ -307,13 +296,13 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 if check_connection:
                     if not check_port(config["ip"], int(config["port"])):
                         continue
-                        
+
                 # config_ping = ping_ip_address(config["ip"], int(config["port"]))
 
                 # Try out to retrieve country code
                 country_code = get_country_from_ip(config["ip"])
                 country_flag = get_country_flag(country_code)
-                continent_emoji = get_continent(country_code)
+
 
                 # Modify the IP address if it's IPV6
                 if is_ipv6(config["ip"]):
@@ -328,9 +317,12 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 config_secrt = 'NA'
                 config_type = 'TCP'
 
+                if config_secrt == 'NONE':
+                    config_secrt = 'NA'
+
                 # Modify configuration title based on server and protocol properties
                 config["title"] = f"\U0001F512 SS-TCP-NA {country_flag} {country_code}-{config['ip']}:{config['port']}"
-                
+
                 # Print out modified configuration
                 print(f"MODIFIED CONFIG: ss://{config['id']}@{config['ip']}:{config['port']}#{config['title']}\n")
 
@@ -338,7 +330,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 modified_array.append(f"ss://{config['id']}@{config['ip']}:{config['port']}#{config['title']}")
 
                 # Append security type array
-                if config_secrt == 'TLS' or config_secrt == 'REALITY':
+                if config_secrt in ('TLS', 'REALITY', 'RLT'):
                     tls_array.append(f"ss://{config['id']}@{config['ip']}:{config['port']}#{config['title']}")
                 elif config_secrt == 'NA':
                     non_tls_array.append(f"ss://{config['id']}@{config['ip']}:{config['port']}#{config['title']}")
@@ -384,6 +376,8 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 "title": trojan_match.group("title"),
             }
 
+            config["port"] = str(validate_config_port(config["port"]))
+
             # Initialize set to append IP addresses
             ips_list = {config["ip"]}
 
@@ -397,23 +391,11 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 continue
 
 
-            # Split configuration parameters and initialize dict for parameters
-            array_params_input = config["params"].split("&")
-            dict_params = {}
-            
-            # Iterate over parameters and split based on key value
-            for pair in array_params_input:
-                try:
-                    key, value = pair.split("=")
-                    key = re.sub(r"servicename", "serviceName", re.sub(r"headertype", "headerType", re.sub(r"allowinsecure", "allowInsecure", key.lower()),),)
-                    dict_params[key] = value
-                except:
-                    pass
+            dict_params = parse_config_params(config["params"])
 
             # Set parameters for servicename and allowinsecure keys
             if (dict_params.get("security", "") in ["reality", "tls"] and dict_params.get("sni", "") == "" and is_valid_domain(config["host"])):
                 dict_params["sni"] = config["host"]
-                dict_params["allowInsecure"] = 1
 
             # Ignore the configurations with specified security and None servicename
             if (dict_params.get("security", "") in ["reality", "tls"] and dict_params.get("sni", "") == ""):
@@ -435,17 +417,14 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 # Try out to retrieve country code
                 country_code = get_country_from_ip(config["ip"])
                 country_flag = get_country_flag(country_code)
-                continent_emoji = get_continent(country_code)
+
 
                 # Modify the IP address if it's IPV6
                 if is_ipv6(config["ip"]):
                     config["ip"] = f"[{config['ip']}]"
 
                 # Define configuration parameters string value and stripped based on & character
-                config["params"] = f"security={dict_params.get('security', '')}&flow={dict_params.get('flow', '')}&sni={dict_params.get('sni', '')}&encryption={dict_params.get('encryption', '')}&type={dict_params.get('type', '')}&serviceName={dict_params.get('serviceName', '')}&host={dict_params.get('host', '')}&path={dict_params.get('path', '')}&headerType={dict_params.get('headerType', '')}&fp={dict_params.get('fp', '')}&pbk={dict_params.get('pbk', '')}&sid={dict_params.get('sid', '')}&alpn={dict_params.get('alpn', '')}&allowInsecure={dict_params.get('allowInsecure', '')}&"
-                config["params"] = re.sub(r"\w+=&", "", config["params"])
-                config["params"] = re.sub(r"(?:encryption=none&)|(?:headerType=none&)", "", config["params"], flags=re.IGNORECASE,)
-                config["params"] = config["params"].strip("&")
+                config["params"] = encode_config_params(dict_params)
 
                 '''
                 # Continue for next IP address if exists in modified array
@@ -454,7 +433,10 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 '''
                 # Retrieve config network type and security type
                 config_type = dict_params.get('type', 'TCP').upper() if dict_params.get('type') not in [None, ''] else 'TCP'
-                config_secrt = dict_params.get('security', 'TLS').upper() if dict_params.get('security') not in [None, ''] else 'NA'
+                config_secrt = (dict_params.get('security') or 'TLS').upper()
+
+                if config_secrt == 'NONE':
+                    config_secrt = 'NA'
 
                 # Modify configuration title based on server and protocol properties
                 config["title"] = f"\U0001F512 TR-{config_type}-{config_secrt} {country_flag} {country_code}-{config['ip']}:{config['port']}"
@@ -466,7 +448,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 modified_array.append(f"trojan://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")
 
                 # Append security type array
-                if config_secrt == 'TLS' or config_secrt == 'REALITY':
+                if config_secrt in ('TLS', 'REALITY', 'RLT'):
                     tls_array.append(f"trojan://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")
                 elif config_secrt == 'NA':
                     non_tls_array.append(f"trojan://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")
@@ -482,7 +464,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                     grpc_array.append(f"trojan://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")
 
 
-    
+
     elif protocol_type == 'VMESS':
         for element in array_configuration:
             # Define VMESS protocol type pattern
@@ -506,7 +488,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
             # Initialize dict to separate match groups by name capturing
             json_string = vmess_match.group("json")
             json_string += "=" * ((4 - len(json_string) % 4) % 4)
-            
+
             # Checkout config json encoded string
             if not is_valid_base64(json_string):
                 # Append invalid json encoded string config into unmatched file
@@ -518,7 +500,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
 
 
             # Decode json string match
-            json_string = base64.b64decode(json_string).decode("utf-8", errors="ignore")
+            json_string = decode_base64(json_string).decode("utf-8", errors="ignore")
 
             try:
                 # Convert decoded json string into dictionary
@@ -549,6 +531,8 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 print(f"INVALID UUID: {config['id']}\n")
                 continue
 
+            config["port"] = str(validate_config_port(config["port"]))
+
             # Initialize set to append IP addresses
             ips_list = {config["ip"]}
 
@@ -565,7 +549,6 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
             # Set parameters for servicename and allowinsecure keys
             if (dict_params.get("tls", "") in ["tls"] and dict_params.get("sni", "") == "" and is_valid_domain(config["host"])):
                 dict_params["sni"] = config["host"]
-                dict_params["allowInsecure"] = 1
 
             # Ignore the configurations with specified security and None servicename
             if (dict_params.get("tls", "") in ["tls"] and dict_params.get("sni", "") == ""):
@@ -587,21 +570,24 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 # Try out to retrieve country code
                 country_code = get_country_from_ip(config["ip"])
                 country_flag = get_country_flag(country_code)
-                continent_emoji = get_continent(country_code)
+
 
                 # Modify the IP address if it's IPV6
                 if is_ipv6(config["ip"]):
                     config["ip"] = f"[{config['ip']}]"
-                    
+
                 # Define configuration parameters string value and stripped based on & character
                 config["params"] = f"tls={dict_params.get('tls', '')}&sni={dict_params.get('sni', '')}&scy={dict_params.get('scy', '')}&net={dict_params.get('net', '')}&host={dict_params.get('host', '')}&path={dict_params.get('path', '')}&type={dict_params.get('type', '')}&fp={dict_params.get('fp', '')}&alpn={dict_params.get('alpn', '')}&aid={dict_params.get('aid', '')}&v={dict_params.get('v', '')}&allowInsecure={dict_params.get('allowInsecure', '')}&"
                 config["params"] = re.sub(r"\w+=&", "", config["params"])
                 config["params"] = re.sub(r"(?:tls=none&)|(?:type=none&)|(?:scy=none&)|(?:scy=auto&)", "", config["params"], flags=re.IGNORECASE,)
                 config["params"] = config["params"].strip("&")
-                
+
                 # Retrieve config network type and security type
                 config_type = dict_params.get('net', 'TCP').upper() if dict_params.get('net') not in [None, ''] else 'TCP'
                 config_secrt = dict_params.get('tls','NA').upper() if dict_params.get('tls') not in [None, ''] else 'NA'
+
+                if config_secrt == 'NONE':
+                    config_secrt = 'NA'
 
                 # Modify configuration title based on server and protocol properties
                 config["title"] = f"\U0001F512 VM-{config_type}-{config_secrt} {country_flag} {country_code}-{config['ip']}:{config['port']}"
@@ -611,12 +597,12 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
 
                 # Print out modified configuration
                 print(f"MODIFIED CONFIG: vmess://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}\n")
-                
+
                 # Append modified configuration into modified array
                 modified_array.append(f"vmess://{base64.b64encode(json.dumps(dict_params).encode('utf-8')).decode('utf-8')}")
 
                 # Append security type array
-                if config_secrt == 'TLS' or config_secrt == 'REALITY':
+                if config_secrt in ('TLS', 'REALITY', 'RLT'):
                     tls_array.append(f"vmess://{base64.b64encode(json.dumps(dict_params).encode('utf-8')).decode('utf-8')}")
                 elif config_secrt == 'NA':
                     non_tls_array.append(f"vmess://{base64.b64encode(json.dumps(dict_params).encode('utf-8')).decode('utf-8')}")
@@ -631,7 +617,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 elif config_type == 'GRPC':
                     grpc_array.append(f"vmess://{base64.b64encode(json.dumps(dict_params).encode('utf-8')).decode('utf-8')}")
 
-    
+
 
     elif protocol_type == 'VLESS' or protocol_type == 'REALITY':
         for element in array_configuration:
@@ -662,11 +648,13 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 "params": vless_match.group("params"),
                 "title": vless_match.group("title"),
             }
-            
+
             # Checkout configuration UUID
             if not is_valid_uuid(config["id"]):
                 print(f"INVALID UUID: {config['id']}\n")
                 continue
+
+            config["port"] = str(validate_config_port(config["port"]))
 
             # Initialize set to append IP addresses
             ips_list = {config["ip"]}
@@ -681,23 +669,11 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 continue
 
 
-            # Split configuration parameters and initialize dict for parameters
-            array_params_input = config["params"].split("&")
-            dict_params = {}
-
-            # Iterate over parameters and split based on key value
-            for pair in array_params_input:
-                try:
-                    key, value = pair.split("=")
-                    key = re.sub(r"servicename", "serviceName", re.sub(r"headertype", "headerType", re.sub(r"allowinsecure", "allowInsecure", key.lower()),),)
-                    dict_params[key] = value
-                except:
-                    pass
+            dict_params = parse_config_params(config["params"])
 
             # Set parameters for servicename and allowinsecure keys
             if (dict_params.get("security", "") in ["reality", "tls"] and dict_params.get("sni", "") == "" and is_valid_domain(config["host"])):
                 dict_params["sni"] = config["host"]
-                dict_params["allowInsecure"] = 1
 
             # Ignore the configurations with specified security and None servicename
             if (dict_params.get("security", "") in ["reality", "tls"] and dict_params.get("sni", "") == ""):
@@ -719,18 +695,15 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 # Try out to retrieve country code
                 country_code = get_country_from_ip(config["ip"])
                 country_flag = get_country_flag(country_code)
-                continent_emoji = get_continent(country_code)
+
 
                 # Modify the IP address if it's IPV6
                 if is_ipv6(config["ip"]):
                     config["ip"] = f"[{config['ip']}]"
 
                 # Define configuration parameters string value and stripped based on & character
-                config["params"] = f"security={dict_params.get('security', '')}&flow={dict_params.get('flow', '')}&sni={dict_params.get('sni', '')}&encryption={dict_params.get('encryption', '')}&type={dict_params.get('type', '')}&serviceName={dict_params.get('serviceName', '')}&host={dict_params.get('host', '')}&path={dict_params.get('path', '')}&headerType={dict_params.get('headerType', '')}&fp={dict_params.get('fp', '')}&pbk={dict_params.get('pbk', '')}&sid={dict_params.get('sid', '')}&alpn={dict_params.get('alpn', '')}&allowInsecure={dict_params.get('allowInsecure', '')}&"
-                config["params"] = re.sub(r"\w+=&", "", config["params"])
-                config["params"] = re.sub(r"(?:encryption=none&)|(?:headerType=none&)", "", config["params"], flags=re.IGNORECASE,)
-                config["params"] = config["params"].strip("&")
-                
+                config["params"] = encode_config_params(dict_params)
+
                 '''
                 # Continue for next IP address if exists in modified array
                 if any(f"vless://{config['id']}@{config['ip']}:{config['port']}?{config['params']}" in array_element for array_element in modified_array):
@@ -739,6 +712,8 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 # Retrieve config network type and security type
                 config_type = dict_params.get('type', 'TCP').upper() if dict_params.get('type') not in [None, ''] else 'TCP'
                 config_secrt = dict_params.get('security','NA').upper() if dict_params.get('security') not in [None, ''] else 'NA'
+                if config_secrt == 'NONE':
+                    config_secrt = 'NA'
                 if config_secrt == 'REALITY':
                     config_secrt = 'RLT'
 
@@ -747,12 +722,12 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
 
                 # Print out modified configuration
                 print(f"MODIFIED CONFIG: vless://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}\n")
-                
+
                 # Append modified configuration into modified array
                 modified_array.append(f"vless://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")
 
                 # Append security type array
-                if config_secrt == 'TLS' or config_secrt == 'REALITY':
+                if config_secrt in ('TLS', 'REALITY', 'RLT'):
                     tls_array.append(f"vless://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")
                 elif config_secrt == 'NA':
                     non_tls_array.append(f"vless://{config['id']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")
@@ -803,6 +778,8 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 print(f"INVALID UUID: {config['id']}\n")
                 continue
 
+            config["port"] = str(validate_config_port(config["port"]))
+
             # Initialize set to append IP addresses
             ips_list = {config["ip"]}
 
@@ -831,7 +808,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 # Try out to retrieve country code
                 country_code = get_country_from_ip(config["ip"])
                 country_flag = get_country_flag(country_code)
-                continent_emoji = get_continent(country_code)
+
 
                 # Modify the IP address if it's IPV6
                 if is_ipv6(config["ip"]):
@@ -879,6 +856,8 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 }
 
 
+                config["port"] = str(validate_config_port(config["port"]))
+
                 # Initialize set to append IP addresses
                 ips_list = {config["ip"]}
 
@@ -907,7 +886,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                     # Try out to retrieve country code
                     country_code = get_country_from_ip(config["ip"])
                     country_flag = get_country_flag(country_code)
-                    continent_emoji = get_continent(country_code)
+
 
                     # Modify the IP address if it's IPV6
                     if is_ipv6(config["ip"]):
@@ -953,6 +932,8 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                 }
 
 
+                config["port"] = str(validate_config_port(config["port"]))
+
                 # Initialize set to append IP addresses
                 ips_list = {config["ip"]}
 
@@ -981,7 +962,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                     # Try out to retrieve country code
                     country_code = get_country_from_ip(config["ip"])
                     country_flag = get_country_flag(country_code)
-                    continent_emoji = get_continent(country_code)
+
 
                     # Modify the IP address if it's IPV6
                     if is_ipv6(config["ip"]):
@@ -995,7 +976,7 @@ def check_modify_config(array_configuration, protocol_type, check_connection = T
                     print(f"MODIFIED CONFIG: hy2://{config['pass']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}\n")
 
                     # Append modified configuration into modified array
-                    modified_array.append(f"hy2://{config['pass']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")                
+                    modified_array.append(f"hy2://{config['pass']}@{config['ip']}:{config['port']}?{config['params']}#{config['title']}")
 
     else:
         modified_array = array_configuration
@@ -1018,7 +999,7 @@ def config_sort(array_configuration, bound_ping = 50):
             vmess_match = re.match(vmess_pattern, config, flags=re.IGNORECASE)
             json_string = vmess_match.group('json')
 
-            json_string = base64.b64decode(json_string).decode("utf-8", errors="ignore")
+            json_string = decode_base64(json_string).decode("utf-8", errors="ignore")
             dict_params = json.loads(json_string)
             dict_params = {k.lower(): v for k, v in dict_params.items()}
 
@@ -1058,7 +1039,7 @@ def create_country(array_configuration):
             vmess_match = re.match(vmess_pattern, config, flags=re.IGNORECASE)
             json_string = vmess_match.group('json')
 
-            json_string = base64.b64decode(json_string).decode("utf-8", errors="ignore")
+            json_string = decode_base64(json_string).decode("utf-8", errors="ignore")
             dict_params = json.loads(json_string)
             dict_params = {k.lower(): v for k, v in dict_params.items()}
 
@@ -1073,40 +1054,32 @@ def create_country(array_configuration):
         if country not in country_config_dict.keys():
             country_config_dict[country] = list()
         country_config_dict[country].append(config)
-    
+
     return country_config_dict
 
 
-def create_country_table(country_path):
-    # Retrive Country List
-    country_code_list = os.listdir(country_path)
-
-    # Counvert country code into country name
-    country_url_pattern = '[Subscription Link](https://raw.githubusercontent.com/soroushmirzaei/telegram-configs-collector/main/countries/{country_code}/mixed)'
-    country_code_name_url = sorted(list(map(lambda element : (element.upper(), pc.country_alpha2_to_country_name(element.upper()) if element.upper() != 'NA' else 'Not Available', country_url_pattern.format(country_code = element)), country_code_list)), key = lambda element : element[1])
-
-    for index, element in enumerate(country_code_name_url):
-        tail_string = ' | '.join(element)
-        country_code_name_url[index] = tail_string
-
-    chunks = list()
-    for i in range(0, len(country_code_name_url), 2):
-        chunk = country_code_name_url[i : i + 2]
-        chunks.append(chunk)
-
-    tail_srtring_list = list()
-    for element in chunks:
-        start = '| '
-        tail_string = ' | '.join(element)
-        end = ' |'
-        tail_string = start + tail_string + end
-        tail_srtring_list.append(tail_string)
-
-    tail_srtring_list = '\n'.join(tail_srtring_list)
-    table_hedar = '''| **Code** | **Country Name** | **Subscription Link** | **Code** | **Country Name** | **Subscription Link** |\n|:---:|:---:|:---:|:---:|:---:|:---:|'''
-    table = table_hedar + '\n' + tail_srtring_list
-
-    return table
+def create_country_table(country_path, repository="0xjavid/telegram-configs-collector", branch="main"):
+    entries = []
+    for path in Path(country_path).iterdir():
+        if not path.is_dir():
+            continue
+        code = path.name.upper()
+        country = pycountry.countries.get(alpha_2=code)
+        if code != "NA" and country is None:
+            continue
+        name = "Not Available" if code == "NA" else country.name
+        link = f"https://raw.githubusercontent.com/{repository}/{branch}/countries/{path.name}/mixed"
+        entries.append((code, name, f"[Subscription Link]({link})"))
+    entries.sort(key=lambda entry: entry[1])
+    rows = []
+    for index in range(0, len(entries), 2):
+        pair = entries[index:index + 2]
+        if len(pair) == 1:
+            pair.append(("", "", ""))
+        rows.append("| " + " | ".join(value for entry in pair for value in entry) + " |")
+    header = ("| **Code** | **Country Name** | **Subscription Link** | **Code** | **Country Name** | **Subscription Link** |\n"
+              "|:---:|:---:|:---:|:---:|:---:|:---:|")
+    return "\n".join([header, *rows])
 
 
 def create_internet_protocol(array_configuration):
@@ -1127,7 +1100,7 @@ def create_internet_protocol(array_configuration):
             vmess_match = re.match(vmess_pattern, config, flags=re.IGNORECASE)
             json_string = vmess_match.group('json')
 
-            json_string = base64.b64decode(json_string).decode("utf-8", errors="ignore")
+            json_string = decode_base64(json_string).decode("utf-8", errors="ignore")
             dict_params = json.loads(json_string)
             dict_params = {k.lower(): v for k, v in dict_params.items()}
 
